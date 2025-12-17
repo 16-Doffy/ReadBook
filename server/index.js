@@ -4,7 +4,7 @@ const cors = require('cors');
 const { faker } = require('@faker-js/faker');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { dbHelpers, AccessKey, User } = require('./database');
+const { dbHelpers, AccessKey, User, Comment } = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -550,6 +550,7 @@ app.post('/api/auth/login', async (req, res) => {
           key_value: key.key_value,
           is_active: key.is_active,
           expires_at: key.expires_at,
+          key_id: key._id.toString(),
         };
       }
     }
@@ -576,6 +577,49 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// Gia hạn key (User)
+app.post('/api/user/extend-key', verifyToken, async (req, res) => {
+  try {
+    const { days } = req.body;
+    const userId = req.userId;
+
+    if (!days || days <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Số ngày gia hạn phải lớn hơn 0',
+      });
+    }
+
+    const user = await dbHelpers.getUserById(userId);
+    if (!user || !user.key_id) {
+      return res.status(404).json({
+        success: false,
+        message: 'User không có key',
+      });
+    }
+
+    const extendedKey = await dbHelpers.extendKeyExpiration(user.key_id, parseInt(days));
+    if (!extendedKey) {
+      return res.status(404).json({
+        success: false,
+        message: 'Không tìm thấy key',
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Đã gia hạn key thêm ${days} ngày`,
+      data: {
+        expires_at: extendedKey.expires_at,
+        new_expiry_date: new Date(extendedKey.expires_at).toLocaleDateString('vi-VN'),
+      },
+    });
+  } catch (error) {
+    console.error('Extend key error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 // Get current user info
 app.get('/api/auth/me', verifyToken, async (req, res) => {
   try {
@@ -592,6 +636,7 @@ app.get('/api/auth/me', verifyToken, async (req, res) => {
           key_value: key.key_value,
           is_active: key.is_active,
           expires_at: key.expires_at,
+          key_id: key._id.toString(),
         };
       }
     }
@@ -614,6 +659,38 @@ app.get('/api/auth/me', verifyToken, async (req, res) => {
   }
 });
 
+// Update current user profile
+app.put('/api/user/profile', verifyToken, async (req, res) => {
+  try {
+    const { full_name, phone } = req.body;
+
+    const user = await dbHelpers.getUserById(req.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    user.full_name = full_name ?? user.full_name;
+    user.phone = phone ?? user.phone;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Cập nhật thông tin thành công',
+      data: {
+        id: user._id.toString(),
+        username: user.username,
+        email: user.email,
+        full_name: user.full_name,
+        phone: user.phone,
+        status: user.status,
+      },
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 // ========== ADMIN API - QUẢN LÝ USERS ==========
 
 // Lấy danh sách tất cả users
@@ -628,6 +705,8 @@ app.get('/api/admin/users', verifyToken, isAdmin, async (req, res) => {
           keyInfo = {
             key_value: key.key_value,
             is_active: key.is_active,
+            expires_at: key.expires_at,
+            key_id: key._id.toString(),
           };
         }
       }
@@ -915,6 +994,177 @@ app.delete('/api/admin/keys/:keyId', async (req, res) => {
 });
 
 // Seed database sau khi MongoDB connect
+// ========== COMMENTS API ==========
+
+// Lấy comments của một truyện
+app.get('/api/comic/:comicId/comments', async (req, res) => {
+  try {
+    const { comicId } = req.params;
+    const comments = await dbHelpers.getCommentsByComic(comicId);
+    const formatted = comments.map(c => ({
+      id: c._id.toString(),
+      username: c.user_id?.username || 'Unknown',
+      content: c.content,
+      rating: c.rating,
+      createdAt: c.createdAt,
+    }));
+    res.json({
+      success: true,
+      data: formatted,
+    });
+  } catch (error) {
+    console.error('Get comments error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Tạo comment mới
+app.post('/api/comic/:comicId/comment', async (req, res) => {
+  try {
+    const { comicId } = req.params;
+    const { content, rating } = req.body;
+    const keyId = req.headers['x-key-id'];
+
+    if (!keyId) {
+      return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
+
+    if (!content || !rating) {
+      return res.status(400).json({ success: false, message: 'Content và rating là bắt buộc' });
+    }
+
+    // Get user from key
+    const key = await AccessKey.findById(keyId);
+    if (!key) {
+      return res.status(401).json({ success: false, message: 'Invalid key' });
+    }
+
+    const user = await User.findOne({ key_id: keyId });
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'User not found' });
+    }
+
+    // Chỉ cho phép 1 đánh giá / user / truyện (dựa trên key + user)
+    const existing = await Comment.findOne({ comic_id: comicId, key_id: keyId });
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        message: 'Bạn đã đánh giá truyện này rồi. Mỗi tài khoản chỉ được đánh giá 1 lần.',
+      });
+    }
+
+    const comment = await dbHelpers.createComment({
+      comic_id: comicId,
+      user_id: user._id,
+      key_id: keyId,
+      content,
+      rating: parseInt(rating),
+    });
+
+    res.json({
+      success: true,
+      message: 'Đã thêm comment thành công',
+      data: {
+        id: comment._id.toString(),
+        username: user.username,
+        content: comment.content,
+        rating: comment.rating,
+        createdAt: comment.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error('Create comment error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ========== ADMIN API - QUẢN LÝ COMMENTS ==========
+
+// Lấy tất cả comments (admin)
+app.get('/api/admin/comments', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const comments = await dbHelpers.getAllComments();
+    const formatted = comments.map(c => ({
+      id: c._id.toString(),
+      comic_title: c.comic_id?.title || 'Unknown',
+      username: c.user_id?.username || 'Unknown',
+      email: c.user_id?.email || 'Unknown',
+      content: c.content,
+      rating: c.rating,
+      is_approved: c.is_approved,
+      createdAt: c.createdAt,
+    }));
+    res.json({
+      success: true,
+      data: formatted,
+    });
+  } catch (error) {
+    console.error('Get all comments error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Xóa comment (admin)
+app.delete('/api/admin/comments/:commentId', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const { commentId } = req.params;
+    await dbHelpers.deleteComment(commentId);
+    res.json({
+      success: true,
+      message: 'Đã xóa comment',
+    });
+  } catch (error) {
+    console.error('Delete comment error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Duyệt/không duyệt comment (admin)
+app.put('/api/admin/comments/:commentId/approve', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const { commentId } = req.params;
+    const { is_approved } = req.body;
+    await dbHelpers.updateCommentApproval(commentId, is_approved);
+    res.json({
+      success: true,
+      message: is_approved ? 'Đã duyệt comment' : 'Đã ẩn comment',
+    });
+  } catch (error) {
+    console.error('Update comment approval error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ========== ADMIN API - THỐNG KÊ ==========
+
+// Thống kê comments
+app.get('/api/admin/stats/comments', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const stats = await dbHelpers.getCommentStats();
+    res.json({
+      success: true,
+      data: stats,
+    });
+  } catch (error) {
+    console.error('Get comment stats error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Thống kê đọc truyện
+app.get('/api/admin/stats/reading', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const stats = await dbHelpers.getReadingStats();
+    res.json({
+      success: true,
+      data: stats,
+    });
+  } catch (error) {
+    console.error('Get reading stats error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 setTimeout(() => {
   seedDatabase();
 }, 2000);

@@ -77,6 +77,20 @@ const BookmarkSchema = new mongoose.Schema({
 
 BookmarkSchema.index({ key_id: 1, comic_id: 1, chapter_number: 1 }, { unique: true });
 
+const CommentSchema = new mongoose.Schema({
+  comic_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Comic', required: true },
+  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  key_id: { type: mongoose.Schema.Types.ObjectId, ref: 'AccessKey', required: true },
+  content: { type: String, required: true },
+  rating: { type: Number, min: 1, max: 5, default: 5 },
+  is_approved: { type: Boolean, default: true },
+}, {
+  timestamps: true,
+});
+
+CommentSchema.index({ comic_id: 1, createdAt: -1 });
+CommentSchema.index({ user_id: 1 });
+
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   email: { type: String, required: true, unique: true },
@@ -99,6 +113,7 @@ const ChapterPage = mongoose.model('ChapterPage', ChapterPageSchema);
 const AccessKey = mongoose.model('AccessKey', AccessKeySchema);
 const ReadingHistory = mongoose.model('ReadingHistory', ReadingHistorySchema);
 const Bookmark = mongoose.model('Bookmark', BookmarkSchema);
+const Comment = mongoose.model('Comment', CommentSchema);
 const User = mongoose.model('User', UserSchema);
 
 // ========== HELPER FUNCTIONS ==========
@@ -210,6 +225,19 @@ const dbHelpers = {
     return await AccessKey.find().sort({ createdAt: -1 });
   },
 
+  extendKeyExpiration: async (keyId, days) => {
+    const key = await AccessKey.findById(keyId);
+    if (!key) return null;
+
+    const currentExpiry = key.expires_at ? new Date(key.expires_at) : new Date();
+    const newExpiry = new Date(currentExpiry);
+    newExpiry.setDate(newExpiry.getDate() + days);
+
+    key.expires_at = newExpiry;
+    await key.save();
+    return key;
+  },
+
   // Reading History
   saveReadingHistory: async (keyId, comicId, chapterNumber) => {
     const existing = await ReadingHistory.findOne({
@@ -317,6 +345,128 @@ const dbHelpers = {
   assignKeyToUser: async (userId, keyId) => {
     return await User.findByIdAndUpdate(userId, { key_id: keyId, status: 'active' }, { new: true });
   },
+
+  // Comments
+  createComment: async (commentData) => {
+    const comment = new Comment(commentData);
+    await comment.save();
+    return comment;
+  },
+
+  getCommentsByComic: async (comicId, limit = 50) => {
+    return await Comment.find({ comic_id: comicId, is_approved: true })
+      .populate('user_id', 'username')
+      .populate('key_id', 'key_value')
+      .sort({ createdAt: -1 })
+      .limit(limit);
+  },
+
+  getAllComments: async () => {
+    return await Comment.find()
+      .populate('comic_id', 'title')
+      .populate('user_id', 'username email')
+      .populate('key_id', 'key_value')
+      .sort({ createdAt: -1 });
+  },
+
+  deleteComment: async (commentId) => {
+    return await Comment.findByIdAndDelete(commentId);
+  },
+
+  updateCommentApproval: async (commentId, isApproved) => {
+    return await Comment.findByIdAndUpdate(commentId, { is_approved: isApproved }, { new: true });
+  },
+
+  getCommentStats: async () => {
+    // Top users by comments
+    const topUsers = await Comment.aggregate([
+      { $group: { _id: '$user_id', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 },
+      { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+      { $unwind: '$user' },
+      { $project: { username: '$user.username', email: '$user.email', commentCount: '$count' } },
+    ]);
+
+    // Top comics by comments
+    const topComics = await Comment.aggregate([
+      { $group: { _id: '$comic_id', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 },
+      { $lookup: { from: 'comics', localField: '_id', foreignField: '_id', as: 'comic' } },
+      { $unwind: '$comic' },
+      { $project: { title: '$comic.title', genre: '$comic.genre', commentCount: '$count' } },
+    ]);
+
+    // Top genres by comments
+    const topGenres = await Comment.aggregate([
+      { $lookup: { from: 'comics', localField: 'comic_id', foreignField: '_id', as: 'comic' } },
+      { $unwind: '$comic' },
+      { $group: { _id: '$comic.genre', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $project: { genre: '$_id', commentCount: '$count' } },
+    ]);
+
+    // Average rating per comic
+    const avgRatings = await Comment.aggregate([
+      { $group: { _id: '$comic_id', avgRating: { $avg: '$rating' }, count: { $sum: 1 } } },
+      { $sort: { avgRating: -1 } },
+      { $limit: 10 },
+      { $lookup: { from: 'comics', localField: '_id', foreignField: '_id', as: 'comic' } },
+      { $unwind: '$comic' },
+      { $project: { title: '$comic.title', avgRating: { $round: ['$avgRating', 1] }, ratingCount: '$count' } },
+    ]);
+
+    return {
+      topUsers,
+      topComics,
+      topGenres,
+      avgRatings,
+    };
+  },
+
+  getReadingStats: async () => {
+    // Top comics by views
+    const topComicsByViews = await Comic.find().sort({ views: -1 }).limit(10).select('title genre views');
+
+    // Top comics by reading history
+    const topComicsByReads = await ReadingHistory.aggregate([
+      { $group: { _id: '$comic_id', readCount: { $sum: 1 } } },
+      { $sort: { readCount: -1 } },
+      { $limit: 10 },
+      { $lookup: { from: 'comics', localField: '_id', foreignField: '_id', as: 'comic' } },
+      { $unwind: '$comic' },
+      { $project: { title: '$comic.title', genre: '$comic.genre', readCount: '$readCount' } },
+    ]);
+
+    // Top genres by reads
+    const topGenresByReads = await ReadingHistory.aggregate([
+      { $lookup: { from: 'comics', localField: 'comic_id', foreignField: '_id', as: 'comic' } },
+      { $unwind: '$comic' },
+      { $group: { _id: '$comic.genre', readCount: { $sum: 1 } } },
+      { $sort: { readCount: -1 } },
+      { $project: { genre: '$_id', readCount: '$readCount' } },
+    ]);
+
+    // Most active users (by reading history)
+    const topUsersByReads = await ReadingHistory.aggregate([
+      { $group: { _id: '$key_id', readCount: { $sum: 1 } } },
+      { $sort: { readCount: -1 } },
+      { $limit: 10 },
+      { $lookup: { from: 'accesskeys', localField: '_id', foreignField: '_id', as: 'key' } },
+      { $unwind: '$key' },
+      { $lookup: { from: 'users', localField: 'key._id', foreignField: 'access_key_id', as: 'user' } },
+      { $unwind: '$user' },
+      { $project: { username: '$user.username', email: '$user.email', readCount: '$readCount' } },
+    ]);
+
+    return {
+      topComicsByViews,
+      topComicsByReads,
+      topGenresByReads,
+      topUsersByReads,
+    };
+  },
 };
 
-module.exports = { mongoose, dbHelpers, Comic, Chapter, ChapterPage, AccessKey, ReadingHistory, Bookmark, User };
+module.exports = { mongoose, dbHelpers, Comic, Chapter, ChapterPage, AccessKey, ReadingHistory, Bookmark, User, Comment };
